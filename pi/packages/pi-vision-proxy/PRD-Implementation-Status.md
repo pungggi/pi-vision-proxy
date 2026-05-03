@@ -113,7 +113,7 @@
 | CC-6 | Telemetry: new session entry types | 🟡 Done | CUSTOM_TYPE_TOOL_CALL constant |
 | CC-7 | Security: closing-tag neutralisation for all three fence tags | 🟡 Done | Updated fenceUntrusted regex |
 | CC-8 | Backwards compat: 1.3.0 config files load unchanged | 🟡 Done | sanitize() fills new fields with defaults |
-| CC-9 | Update README.md | ⬜ Not started | |
+| CC-9 | Update README.md | ✅ Complete | Updated for 1.4.0 GA with all features documented | |
 
 ## Tests
 
@@ -153,7 +153,7 @@
 | 1.4.0-beta.2 | Feature 3 (slash commands with crop syntax) | ✅ Complete |
 | 1.4.0-beta.3 | Feature 2 (`maxBatch=1` default), adaptive prompt, hints | ✅ Complete |
 | 1.4.0-beta.4 | Feature 4 (grounding registry, Tier 1 list) | ✅ Complete |
-| 1.4.0 | Flip `tool=on`, `maxBatch=4` | ⬜ Not started |
+| 1.4.0 | Flip `tool=on`, `maxBatch=4` | ✅ Complete |
 
 ---
 
@@ -161,6 +161,7 @@
 
 | Date | Change |
 |---|---|
+| 2026-05-03 | **1.4.0 GA**: Flipped defaults (tool=on, maxBatch=4). Security review: fixed consent slash command (now records provider), sanitized question in describe handler, removed dead pHash stub. Updated README.md. 180 tests passing. |
 | 2026-05-03 | Milestone beta.4: Feature 4 grounding-models slash commands (add/remove/list/reset), excluded-model warnings, parseGroundingFormat validator. 180 tests passing. |
 | 2026-05-03 | Milestone beta.3: Feature 2 (multi-image batched comparison). Auto-proxy joint descriptions for N≥2 images, adaptive joint prompt with comparison structure, filename hint patterns (Appendix D), pHash infrastructure, buildJointDescriptionFence. 172 tests passing. |
 | 2026-05-03 | Milestone beta.2: Feature 3 (`/vision-proxy describe` + `redescribe`) fully implemented. parseDescribeArgs with all three crop forms, --question/--crop/--model/--save flags, consent checks, [Vision Proxy] TUI prefix, vision_proxy.command telemetry. 152 tests passing. |

@@ -1095,9 +1095,9 @@ describe("sanitize (1.4.0 fields)", () => {
 			systemPrompt: "test",
 			includeContext: true,
 		} as VisionConfig);
-		assert.equal(result.tool, "off");
+		assert.equal(result.tool, "on");
 		assert.equal(result.maxImagesPerCall, 10);
-		assert.equal(result.maxBatch, 1);
+		assert.equal(result.maxBatch, 4);
 		assert.equal(result.cacheSize, 50);
 		assert.equal(result.pHashSimilarityThreshold, 0.8);
 		assert.ok(result.groundingModels);

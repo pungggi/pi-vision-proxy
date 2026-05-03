@@ -947,22 +947,6 @@ export default function (pi: ExtensionAPI) {
 							hints.push(...generateFilenameHints(filenames));
 						}
 
-						// pHash similarity hint (FR-2.5.2)
-						try {
-							const hashes = await Promise.all(
-								successful.map(async (r) => {
-									const buf = Buffer.from(r.hash, "hex"); // hash is truncated sha256, not useful directly
-									// Use the raw image data from the earlier analyzeImages call
-									// We need to get the original image bytes — they were converted to PiAiImage
-									return null as string | null;
-								}),
-							);
-							// pHash requires raw image bytes — we don't have them here.
-							// Skip pHash for auto-proxy joint calls (available for tool path via analyze_image).
-						} catch {
-							// pHash failed — skip hint
-						}
-
 						const jointPrompt = buildAdaptiveJointPrompt(jointMetas, event.prompt, hints.length > 0 ? hints : undefined);
 						const jointImages = successful.map((r) => {
 							// Reconstruct PiAiImage from the stored data
@@ -1172,12 +1156,12 @@ export default function (pi: ExtensionAPI) {
 			// ── Consent ─────────────────────────────────────────
 			if (sub === "consent") {
 				if (isTrue(valueLower)) {
-					pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted: true });
+					pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted: true, provider: effective.provider });
 					ctx.ui.notify("[vision-proxy] Consent granted.", "info");
 					return;
 				}
 				if (isFalse(valueLower)) {
-					pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted: false });
+					pi.appendEntry<ConsentEntry>(CUSTOM_TYPE_CONSENT, { granted: false, provider: effective.provider });
 					ctx.ui.notify("[vision-proxy] Consent revoked.", "warning");
 					return;
 				}
@@ -1530,7 +1514,7 @@ export default function (pi: ExtensionAPI) {
 							? `You are analysing ${imagePayloads.length} images.\n${imageLabels}\n\n`
 							: "") +
 						`Answer the following question about the image${imagePayloads.length > 1 ? "s" : ""}:\n` +
-						`<question>\n${question}\n</question>\n\n` +
+						`<question>\n${sanitizeXml(question)}\n</question>\n\n` +
 						`Respond in the same language as the question. Be precise and factual.`,
 				});
 				for (const p of imagePayloads) {
