@@ -1,6 +1,6 @@
 {
   "name": "pi-multimodal-proxy",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Automatic image, video and audio description for any model in Pi. Routes media to a multimodal model and injects descriptions into context.",
   "keywords": [
     "pi-package"

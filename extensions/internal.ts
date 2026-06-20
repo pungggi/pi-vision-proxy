@@ -71,6 +71,96 @@ function evictImageMeta(): void {
 	}
 }
 
+// ── Session image recall ────────────────────────────────────────────────────
+//
+// Retains the actual image bytes (base64) of images seen this session, keyed by
+// hash, so the agent can re-query a previously-seen image with analyze_image
+// even when it is no longer attached to the current turn (e.g. a screenshot the
+// user pasted several turns ago). Storage is in-memory only — image bytes are
+// never written to the session log or disk, keeping the existing data-egress
+// posture intact. Insertion order is used for LRU eviction once the byte budget
+// is exceeded.
+
+/** In-memory map: image hash → retained base64 bytes + mime type, for recall. */
+export const _imageData = new Map<string, { data: string; mimeType: string }>();
+
+/** Running total of retained base64 string length across _imageData. */
+let _imageDataBytes = 0;
+
+/** Default byte budget for retained image data (base64 length, ≈64 MB). */
+const IMAGE_DATA_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
+
+/** Resolve the recall byte budget, allowing an env override. */
+function imageDataMaxBytes(): number {
+	const raw = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+	if (raw) {
+		const n = Number.parseInt(raw, 10);
+		if (Number.isFinite(n) && n >= 0) return n;
+	}
+	return IMAGE_DATA_MAX_BYTES_DEFAULT;
+}
+
+function evictImageData(): void {
+	const budget = imageDataMaxBytes();
+	// Keep at least one entry so a single oversized image is still recallable.
+	while (_imageDataBytes > budget && _imageData.size > 1) {
+		const first = _imageData.keys().next().value;
+		if (first === undefined) break;
+		const v = _imageData.get(first);
+		_imageData.delete(first);
+		if (v) _imageDataBytes -= v.data.length;
+	}
+}
+
+/** Retain an image's bytes for later recall. No-op if already retained (LRU bumped). */
+export function storeImageData(hash: string, data: string, mimeType: string): void {
+	if (!hash || !data) return;
+	const existing = _imageData.get(hash);
+	if (existing) {
+		// Bump recency: re-insert at the end of the iteration order.
+		_imageData.delete(hash);
+		_imageData.set(hash, existing);
+		return;
+	}
+	_imageData.set(hash, { data, mimeType });
+	_imageDataBytes += data.length;
+	evictImageData();
+}
+
+/** Fetch retained image bytes by hash, bumping recency. Undefined if not retained. */
+export function getImageData(hash: string): { data: string; mimeType: string } | undefined {
+	const v = _imageData.get(hash);
+	if (v) {
+		_imageData.delete(hash);
+		_imageData.set(hash, v);
+	}
+	return v;
+}
+
+/** Test/maintenance helper: drop all retained image bytes. */
+export function clearImageData(): void {
+	_imageData.clear();
+	_imageDataBytes = 0;
+}
+
+/**
+ * Parse an analyze_image reference as a session-recall handle.
+ *
+ * Accepts the `image="..."` value carried by <vision_proxy_description> and
+ * related fences — either a bare hash, a `sha256:`-prefixed hash, or a hash with
+ * a `#crop:...` suffix (the crop suffix is ignored; recall returns the full
+ * image and any crop is re-applied via the tool's crop argument). Returns the
+ * normalized lowercase hash, or null if the reference is not a recall handle
+ * (in which case it should be treated as a file path).
+ */
+export function parseRecallRef(ref: string): string | null {
+	let s = ref.trim();
+	if (s.startsWith("sha256:")) s = s.slice("sha256:".length);
+	const hashPart = s.split("#")[0];
+	const re = new RegExp(`^[a-f0-9]{${HASH_HEX_LEN}}$`, "i");
+	return re.test(hashPart) ? hashPart.toLowerCase() : null;
+}
+
 // ── Crop types ────────────────────────────────────────────────────────────
 
 export type NamedRegion =

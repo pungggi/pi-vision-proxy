@@ -70,6 +70,11 @@ import {
 	writePersistentFile,
 	sanitizeForLog,
 	storeImageMeta,
+	storeImageData,
+	getImageData,
+	clearImageData,
+	parseRecallRef,
+	_imageData,
 	_imageMeta,
 } from "../internal.ts";
 
@@ -282,6 +287,114 @@ describe("pluralImages", () => {
 		assert.equal(pluralImages(1), "1 image");
 		assert.equal(pluralImages(0), "0 images");
 		assert.equal(pluralImages(5), "5 images");
+	});
+});
+
+describe("parseRecallRef", () => {
+	const hash = "a".repeat(32);
+
+	it("accepts a bare 32-hex hash", () => {
+		assert.equal(parseRecallRef(hash), hash);
+	});
+
+	it("accepts a sha256:-prefixed hash", () => {
+		assert.equal(parseRecallRef(`sha256:${hash}`), hash);
+	});
+
+	it("strips a #crop suffix and recalls the base image", () => {
+		assert.equal(parseRecallRef(`${hash}#crop:1840,120,840,360`), hash);
+	});
+
+	it("normalizes uppercase to lowercase", () => {
+		assert.equal(parseRecallRef("A".repeat(32)), hash);
+	});
+
+	it("rejects file paths and non-hash refs", () => {
+		assert.equal(parseRecallRef("/tmp/shot.png"), null);
+		assert.equal(parseRecallRef("./a.png"), null);
+		assert.equal(parseRecallRef("screenshot.png"), null);
+		// Wrong length / non-hex
+		assert.equal(parseRecallRef("a".repeat(31)), null);
+		assert.equal(parseRecallRef("a".repeat(33)), null);
+		assert.equal(parseRecallRef("z".repeat(32)), null);
+	});
+});
+
+describe("session image recall store", () => {
+	it("round-trips retained image bytes by hash", () => {
+		clearImageData();
+		storeImageData("hash1", "AAAA", "image/png");
+		const got = getImageData("hash1");
+		assert.deepEqual(got, { data: "AAAA", mimeType: "image/png" });
+		assert.equal(getImageData("missing"), undefined);
+		clearImageData();
+	});
+
+	it("ignores empty hash or data", () => {
+		clearImageData();
+		storeImageData("", "AAAA", "image/png");
+		storeImageData("hash", "", "image/png");
+		assert.equal(_imageData.size, 0);
+		clearImageData();
+	});
+
+	it("does not duplicate on re-store of the same hash", () => {
+		clearImageData();
+		storeImageData("hash1", "AAAA", "image/png");
+		storeImageData("hash1", "AAAA", "image/png");
+		assert.equal(_imageData.size, 1);
+		clearImageData();
+	});
+
+	it("evicts least-recently-used entries past the byte budget", () => {
+		clearImageData();
+		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+		// Budget of 10 base64 chars; each entry below is 8 chars.
+		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "10";
+		try {
+			storeImageData("h1", "AAAAAAAA", "image/png"); // 8 bytes, total 8
+			storeImageData("h2", "BBBBBBBB", "image/png"); // 8 bytes, total 16 > 10 → evict h1
+			assert.equal(getImageData("h1"), undefined);
+			assert.deepEqual(getImageData("h2"), { data: "BBBBBBBB", mimeType: "image/png" });
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
+			clearImageData();
+		}
+	});
+
+	it("keeps a single oversized image rather than evicting everything", () => {
+		clearImageData();
+		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "4";
+		try {
+			storeImageData("big", "AAAAAAAAAAAA", "image/png"); // 12 bytes > 4 budget
+			assert.deepEqual(getImageData("big"), { data: "AAAAAAAAAAAA", mimeType: "image/png" });
+			assert.equal(_imageData.size, 1);
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
+			clearImageData();
+		}
+	});
+
+	it("bumps recency on access so the touched entry survives eviction", () => {
+		clearImageData();
+		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "20";
+		try {
+			storeImageData("h1", "AAAAAAAA", "image/png"); // total 8
+			storeImageData("h2", "BBBBBBBB", "image/png"); // total 16
+			getImageData("h1"); // bump h1 to most-recent
+			storeImageData("h3", "CCCCCCCC", "image/png"); // total 24 > 20 → evict LRU (h2)
+			assert.deepEqual(getImageData("h1"), { data: "AAAAAAAA", mimeType: "image/png" });
+			assert.equal(getImageData("h2"), undefined);
+			assert.deepEqual(getImageData("h3"), { data: "CCCCCCCC", mimeType: "image/png" });
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
+			clearImageData();
+		}
 	});
 });
 

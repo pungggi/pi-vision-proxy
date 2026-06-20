@@ -6,6 +6,10 @@ When images are sent, this extension routes them to a **vision-capable model**, 
 
 When **video or audio files** are detected, they are routed to a **multimodal model** (default: Grok 4.3) that natively understands video content — transcribing speech with speaker diarization, describing visual scenes, reading on-screen text, and reasoning about the content — all in a single call.
 
+## What's new in 1.7.0
+
+- **Session image recall** — the agent can re-query an image it saw earlier in the session without a re-attachment or file path. Pass the `image="..."` id from any vision-proxy fence back to `analyze_image` (or `/multimodal-proxy describe`) to re-examine or crop *"that screenshot from before"*. Image bytes are retained in memory only (never persisted), in a byte-bounded LRU store configurable via `PI_VISION_PROXY_IMAGE_RECALL_BYTES` (default 64 MB).
+
 ## What's new in 1.5.0
 
 - **Video/audio support** — automatically detects video files (`.mp4`, `.mkv`, `.webm`, `.avi`, `.mov`, etc.) and audio files (`.mp3`, `.wav`, `.m4a`, `.flac`, etc.) in prompts, routes them to a video-capable model, and injects a rich multimodal description into context.
@@ -77,6 +81,7 @@ Legacy alias: /vision-proxy <args> works identically.
 | `PI_VISION_PROXY_MAX_BATCH` | 1–10 | `4` |
 | `PI_VISION_PROXY_CACHE_SIZE` | 0–500 | `50` |
 | `PI_VISION_PROXY_MAX_IMAGE_BYTES` | positive integer | `10485760` (10 MB) |
+| `PI_VISION_PROXY_IMAGE_RECALL_BYTES` | non-negative integer | `67108864` (64 MB) — in-memory budget for session image recall |
 | `PI_VISION_PROXY_ALLOW_HOME` | `1` to allow files under your home directory on non-drive platforms/volumes | not set |
 | `PI_VISION_PROXY_ALLOW_DRIVES` | `0`/`false`/`off` to disable local Windows drive paths; otherwise local drive paths like `D:\Downloads\video.mp4` are allowed | enabled by default |
 | `PI_VISION_PROXY_VIDEO_MODEL` | `provider/model-id` | `xai/grok-4.3` |
@@ -112,11 +117,26 @@ User sends prompt + image(s)
   analyze_image tool (when enabled)
         │
         ├─ Agent sends targeted question + optional crop
+        ├─ Image reference is either a file path OR the image="..." id from a
+        │   prior fence — session recall lets the agent re-query an image it saw
+        │   earlier in the session without a re-attachment or path
         ├─ Image cropped locally (ImageScript), ONLY cropped region sent to vision model
         ├─ Result cached by (hashes, crop, question, model)
         ├─ Max 10 tool calls per turn (rate limit)
         └─ Returned in <vision_proxy_analysis> fence with metadata
 ```
+
+### Session image recall
+
+Every `<vision_proxy_description>`, `<vision_proxy_analysis>`, and
+`<vision_proxy_joint_description>` block carries an `image="..."` id. The agent
+can pass that id back to `analyze_image` (or `/multimodal-proxy describe`) to
+re-examine or crop an image the user shared earlier in the session — even once
+it is no longer attached to the current message (e.g. *"zoom into that
+screenshot from before"*). The image bytes are retained **in memory only** for
+the life of the session, never written to the session log or disk, and are
+evicted oldest-first once the recall budget (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`,
+default 64 MB) is exceeded.
 
 ## How it works — Video & Audio
 
@@ -206,6 +226,7 @@ This extension **sends data to a third-party provider**. By default that is `ant
 7. **Rate limiting** — the `analyze_image` tool is limited to 10 calls per agent turn to prevent cost runaway from looping model behaviour.
 8. **Decode bomb protection** — images exceeding 16 384 × 16 384 pixels are rejected before full decode to prevent memory exhaustion.
 9. **Telemetry sanitisation** — all fields logged in session entries (question, reason) are stripped of control characters and length-limited to 200 characters.
+10. **Session image recall** — to support re-querying an earlier image, the raw image bytes are retained **in process memory only**, never persisted to the session log or disk. The store is bounded (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`, default 64 MB) with oldest-first eviction, and is discarded when the process exits — it does not survive a resume or fork.
 
 For the full security audit see [`SECURITY-REVIEW.md`](./SECURITY-REVIEW.md).
 
