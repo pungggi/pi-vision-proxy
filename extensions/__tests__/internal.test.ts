@@ -8,7 +8,7 @@
  */
 
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join, parse } from "node:path";
@@ -59,6 +59,7 @@ import {
 	hammingDistance,
 	computePHash,
 	cropImage,
+	shutdownCropWorkers,
 	piAiImageToBuffer,
 	bufferToPiAiImage,
 	shouldStripImages,
@@ -70,16 +71,15 @@ import {
 	writePersistentFile,
 	sanitizeForLog,
 	storeImageMeta,
+	createImageMetaStore,
 	storeImageData,
 	getImageData,
-	clearImageData,
+	createImageDataStore,
 	parseRecallRef,
 	spinnerFrame,
 	formatProgressStatus,
 	SPINNER_FRAMES,
 	RECALL_HINT,
-	_imageData,
-	_imageMeta,
 } from "../internal.ts";
 
 // SessionEntry minimal shape — typed loose because peer dep types are not loaded in test
@@ -326,79 +326,81 @@ describe("parseRecallRef", () => {
 
 describe("session image recall store", () => {
 	it("round-trips retained image bytes by hash", () => {
-		clearImageData();
-		storeImageData("hash1", "AAAA", "image/png");
-		const got = getImageData("hash1");
+		const store = createImageDataStore();
+		storeImageData(store, "hash1", "AAAA", "image/png");
+		const got = getImageData(store, "hash1");
 		assert.deepEqual(got, { data: "AAAA", mimeType: "image/png" });
-		assert.equal(getImageData("missing"), undefined);
-		clearImageData();
+		assert.equal(getImageData(store, "missing"), undefined);
 	});
 
 	it("ignores empty hash or data", () => {
-		clearImageData();
-		storeImageData("", "AAAA", "image/png");
-		storeImageData("hash", "", "image/png");
-		assert.equal(_imageData.size, 0);
-		clearImageData();
+		const store = createImageDataStore();
+		storeImageData(store, "", "AAAA", "image/png");
+		storeImageData(store, "hash", "", "image/png");
+		assert.equal(store.map.size, 0);
 	});
 
 	it("does not duplicate on re-store of the same hash", () => {
-		clearImageData();
-		storeImageData("hash1", "AAAA", "image/png");
-		storeImageData("hash1", "AAAA", "image/png");
-		assert.equal(_imageData.size, 1);
-		clearImageData();
+		const store = createImageDataStore();
+		storeImageData(store, "hash1", "AAAA", "image/png");
+		storeImageData(store, "hash1", "AAAA", "image/png");
+		assert.equal(store.map.size, 1);
+	});
+
+	it("keeps stores isolated — one session's bytes do not leak into another (issue #12)", () => {
+		const sessionA = createImageDataStore();
+		const sessionB = createImageDataStore();
+		storeImageData(sessionA, "hash1", "AAAA", "image/png");
+		assert.deepEqual(getImageData(sessionA, "hash1"), { data: "AAAA", mimeType: "image/png" });
+		assert.equal(getImageData(sessionB, "hash1"), undefined);
 	});
 
 	it("evicts least-recently-used entries past the byte budget", () => {
-		clearImageData();
+		const store = createImageDataStore();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 		// Budget of 10 decoded bytes; each 8-char base64 entry decodes to 6 bytes.
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "10";
 		try {
-			storeImageData("h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
-			storeImageData("h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12 > 10 → evict h1
-			assert.equal(getImageData("h1"), undefined);
-			assert.deepEqual(getImageData("h2"), { data: "BBBBBBBB", mimeType: "image/png" });
+			storeImageData(store, "h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
+			storeImageData(store, "h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12 > 10 → evict h1
+			assert.equal(getImageData(store, "h1"), undefined);
+			assert.deepEqual(getImageData(store, "h2"), { data: "BBBBBBBB", mimeType: "image/png" });
 		} finally {
 			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
-			clearImageData();
 		}
 	});
 
 	it("keeps a single oversized image rather than evicting everything", () => {
-		clearImageData();
+		const store = createImageDataStore();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "4";
 		try {
-			storeImageData("big", "AAAAAAAAAAAA", "image/png"); // 9 decoded bytes > 4 budget
-			assert.deepEqual(getImageData("big"), { data: "AAAAAAAAAAAA", mimeType: "image/png" });
-			assert.equal(_imageData.size, 1);
+			storeImageData(store, "big", "AAAAAAAAAAAA", "image/png"); // 9 decoded bytes > 4 budget
+			assert.deepEqual(getImageData(store, "big"), { data: "AAAAAAAAAAAA", mimeType: "image/png" });
+			assert.equal(store.map.size, 1);
 		} finally {
 			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
-			clearImageData();
 		}
 	});
 
 	it("bumps recency on access so the touched entry survives eviction", () => {
-		clearImageData();
+		const store = createImageDataStore();
 		const prev = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 		// Budget of 14 decoded bytes; each 8-char base64 entry decodes to 6 bytes.
 		process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = "14";
 		try {
-			storeImageData("h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
-			storeImageData("h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12
-			getImageData("h1"); // bump h1 to most-recent
-			storeImageData("h3", "CCCCCCCC", "image/png"); // 6 decoded bytes, total 18 > 14 → evict LRU (h2)
-			assert.deepEqual(getImageData("h1"), { data: "AAAAAAAA", mimeType: "image/png" });
-			assert.equal(getImageData("h2"), undefined);
-			assert.deepEqual(getImageData("h3"), { data: "CCCCCCCC", mimeType: "image/png" });
+			storeImageData(store, "h1", "AAAAAAAA", "image/png"); // 6 decoded bytes, total 6
+			storeImageData(store, "h2", "BBBBBBBB", "image/png"); // 6 decoded bytes, total 12
+			getImageData(store, "h1"); // bump h1 to most-recent
+			storeImageData(store, "h3", "CCCCCCCC", "image/png"); // 6 decoded bytes, total 18 > 14 → evict LRU (h2)
+			assert.deepEqual(getImageData(store, "h1"), { data: "AAAAAAAA", mimeType: "image/png" });
+			assert.equal(getImageData(store, "h2"), undefined);
+			assert.deepEqual(getImageData(store, "h3"), { data: "CCCCCCCC", mimeType: "image/png" });
 		} finally {
 			if (prev === undefined) delete process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
 			else process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES = prev;
-			clearImageData();
 		}
 	});
 });
@@ -1474,6 +1476,10 @@ async function create10x10Png(): Promise<Buffer> {
 }
 
 describe("cropImage (ImageScript)", () => {
+	after(async () => {
+		await shutdownCropWorkers();
+	});
+
 	it("crops a 10×10 PNG to a 5×5 region", async () => {
 		const png = await create10x10Png();
 		const crop = { x: 2, y: 3, width: 5, height: 5 };
@@ -1507,6 +1513,92 @@ describe("cropImage (ImageScript)", () => {
 		// JPEG should start with FF D8
 		assert.equal(result[0], 0xff);
 		assert.equal(result[1], 0xd8);
+	});
+
+	it("succeeds within a generous decode timeout (env override is honoured)", async () => {
+		const prev = process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS;
+		process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS = "10000";
+		try {
+			const png = await create10x10Png();
+			const result = await cropImage(png, { x: 0, y: 0, width: 10, height: 10 }, "image/png");
+			assert.ok(result, "crop should succeed with a generous timeout");
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS;
+			else process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS = prev;
+		}
+	});
+
+	it("returns null (no throw) for undecodable garbage bytes", async () => {
+		const garbage = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]);
+		const result = await cropImage(garbage, { x: 0, y: 0, width: 5, height: 5 }, "image/png");
+		assert.equal(result, null);
+	});
+
+	it("falls back to the in-thread path when the worker is disabled", async () => {
+		const prev = process.env.PI_VISION_PROXY_DECODE_WORKER;
+		process.env.PI_VISION_PROXY_DECODE_WORKER = "0";
+		try {
+			const png = await create10x10Png();
+			const result = await cropImage(png, { x: 2, y: 3, width: 5, height: 5 }, "image/png");
+			assert.ok(result, "in-thread fallback should still crop");
+			const dims = extractDimensions(result);
+			assert.ok(dims && dims.width === 5 && dims.height === 5, "fallback crop should have correct dims");
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_DECODE_WORKER;
+			else process.env.PI_VISION_PROXY_DECODE_WORKER = prev;
+		}
+	});
+
+	it("handles several sequential crops (worker pool reuse)", async () => {
+		const png = await create10x10Png();
+		for (let i = 0; i < 5; i++) {
+			const result = await cropImage(png, { x: 0, y: 0, width: 5, height: 5 }, "image/png");
+			assert.ok(result, `crop ${i} should succeed`);
+			const dims = extractDimensions(result);
+			assert.ok(dims && dims.width === 5 && dims.height === 5, `crop ${i} dims`);
+		}
+	});
+
+	it("works with pooling disabled (spawn-per-call)", async () => {
+		const prev = process.env.PI_VISION_PROXY_DECODE_WORKER_POOL;
+		process.env.PI_VISION_PROXY_DECODE_WORKER_POOL = "0";
+		try {
+			const png = await create10x10Png();
+			const a = await cropImage(png, { x: 0, y: 0, width: 5, height: 5 }, "image/png");
+			const b = await cropImage(png, { x: 1, y: 1, width: 4, height: 4 }, "image/png");
+			assert.ok(a && b, "both crops should succeed without pooling");
+		} finally {
+			if (prev === undefined) delete process.env.PI_VISION_PROXY_DECODE_WORKER_POOL;
+			else process.env.PI_VISION_PROXY_DECODE_WORKER_POOL = prev;
+		}
+	});
+
+	it("hard-terminates the worker on timeout (returns null, does not hang)", async () => {
+		// Force pool=0 so a *fresh* worker is spawned (never a warmed pooled one).
+		// Spinning up a thread + loading ImageScript + instantiating the WASM codec
+		// is reliably far slower than the 1ms timeout regardless of machine speed,
+		// so the main-thread timer fires and terminate()s the worker — proving the
+		// timeout is a hard limit, without depending on wall-clock scheduling luck.
+		const prevWorker = process.env.PI_VISION_PROXY_DECODE_WORKER;
+		const prevPool = process.env.PI_VISION_PROXY_DECODE_WORKER_POOL;
+		const prevTimeout = process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS;
+		process.env.PI_VISION_PROXY_DECODE_WORKER = "1";
+		process.env.PI_VISION_PROXY_DECODE_WORKER_POOL = "0";
+		process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS = "1";
+		try {
+			const png = await create10x10Png();
+			const started = Date.now();
+			const result = await cropImage(png, { x: 0, y: 0, width: 10, height: 10 }, "image/png");
+			assert.equal(result, null, "timed-out crop should return null");
+			assert.ok(Date.now() - started < 5000, "should return promptly, not hang");
+		} finally {
+			if (prevWorker === undefined) delete process.env.PI_VISION_PROXY_DECODE_WORKER;
+			else process.env.PI_VISION_PROXY_DECODE_WORKER = prevWorker;
+			if (prevPool === undefined) delete process.env.PI_VISION_PROXY_DECODE_WORKER_POOL;
+			else process.env.PI_VISION_PROXY_DECODE_WORKER_POOL = prevPool;
+			if (prevTimeout === undefined) delete process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS;
+			else process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS = prevTimeout;
+		}
 	});
 });
 
@@ -2111,8 +2203,9 @@ describe("Security: image decode bomb protection", () => {
 		const img = new Image(100, 100);
 		const encoded = Buffer.from(await img.encode(1));
 		const hash = "test-decode-bomb-normal";
-		storeImageMeta(hash, encoded);
-		const meta = _imageMeta.get(hash);
+		const store = createImageMetaStore();
+		storeImageMeta(store, hash, encoded);
+		const meta = store.get(hash);
 		// Normal image should be accepted
 		assert.ok(meta, "normal image should be stored");
 	});
@@ -2203,10 +2296,21 @@ describe("Review fixes: storeImageMeta filename backfill", () => {
 		const img = new Image(50, 60);
 		const encoded = Buffer.from(await img.encode(1));
 		const hash = "test-backfill-filename";
-		storeImageMeta(hash, encoded); // first call, no filename
-		storeImageMeta(hash, encoded, "photo.png"); // second call, with filename
-		const meta = _imageMeta.get(hash);
+		const store = createImageMetaStore();
+		storeImageMeta(store, hash, encoded); // first call, no filename
+		storeImageMeta(store, hash, encoded, "photo.png"); // second call, with filename
+		const meta = store.get(hash);
 		assert.ok(meta, "meta should exist");
 		assert.equal(meta!.filename, "photo.png", "filename should be backfilled");
+	});
+
+	it("keeps stores isolated — one session's metadata does not leak into another (issue #12)", async () => {
+		const { Image } = await import("imagescript");
+		const encoded = Buffer.from(await new Image(40, 30).encode(1));
+		const sessionA = createImageMetaStore();
+		const sessionB = createImageMetaStore();
+		storeImageMeta(sessionA, "shared-hash", encoded, "a.png");
+		assert.ok(sessionA.get("shared-hash"), "session A should have the metadata");
+		assert.equal(sessionB.get("shared-hash"), undefined, "session B must not inherit it");
 	});
 });

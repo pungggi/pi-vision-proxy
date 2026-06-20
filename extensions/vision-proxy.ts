@@ -97,6 +97,8 @@ import {
 	hashImageData,
 	hammingDistance,
 	type ImageMeta,
+	type ImageMetaStore,
+	createImageMetaStore,
 	type LegacyImage,
 	parseDescribeArgs,
 	parseGroundingFormat,
@@ -126,11 +128,12 @@ import {
 	type VideoDescriptionEntry,
 	VALID_GROUNDING_FORMATS,
 	writePersistentFile,
-	_imageMeta,
 	storeImageMeta,
 	storeImageData,
 	getImageData,
 	clearImageData,
+	createImageDataStore,
+	type ImageDataStore,
 	parseRecallRef,
 	spinnerFrame,
 	formatProgressStatus,
@@ -203,15 +206,46 @@ const TOOL_DESCRIPTION = [
 	"The tool result is authoritative for the specific question asked; the cached generic description remains the default for everything else.",
 ].join("\n");
 
-// ── Tool result cache (shared across calls in the session) ─────────────────
-
-const _toolCache = new LRUCache<string, string>(50);
-
 /** Maximum analyze_image tool calls per agent turn. Prevents cost runaway. */
 const MAX_TOOL_CALLS_PER_TURN = 10;
 
-/** Current turn's tool call count (reset on each before_agent_start). */
-let _toolCallCount = 0;
+/** Default tool-result cache size; resized to config.cacheSize on first use. */
+const DEFAULT_TOOL_CACHE_SIZE = 50;
+
+// ── Per-session state ──────────────────────────────────────────────────────
+// Multiple Pi sessions can share a single Node process (tmux, SDK-spawned
+// agents). Module-level singletons would let one session's tool-result cache
+// and per-turn rate-limit counter bleed into another's, making the limit
+// unreliable. Key the state off the session's SessionManager instance, which
+// is unique per session; the WeakMap entry is reclaimed when the session ends.
+
+interface SessionState {
+	/** Tool result cache, shared across calls within one session. */
+	toolCache: LRUCache<string, string>;
+	/** Current turn's tool call count (reset on each before_agent_start). */
+	toolCallCount: number;
+	/** Image hash → dimensions/filename, populated on first ingestion this session. */
+	imageMeta: ImageMetaStore;
+	/** Retained image bytes for analyze_image session recall. */
+	imageData: ImageDataStore;
+}
+
+const _sessionState = new WeakMap<object, SessionState>();
+
+function getSessionState(ctx: ExtensionContext): SessionState {
+	const key = ctx.sessionManager as unknown as object;
+	let state = _sessionState.get(key);
+	if (!state) {
+		state = {
+			toolCache: new LRUCache<string, string>(DEFAULT_TOOL_CACHE_SIZE),
+			toolCallCount: 0,
+			imageMeta: createImageMetaStore(),
+			imageData: createImageDataStore(),
+		};
+		_sessionState.set(key, state);
+	}
+	return state;
+}
 
 /** Sanitize text for embedding inside XML-like tags. */
 function sanitizeXml(text: string): string {
@@ -551,6 +585,7 @@ async function analyzeImages(
 		? `\n\n## Recent conversation (untrusted user dialogue, for grounding only)\n<conversation>\n${conversationContext}\n</conversation>`
 		: "";
 
+	const { imageMeta, imageData } = getSessionState(ctx);
 	let completed = 0;
 	const rawTasks = images.map(async (raw, i): Promise<AnalysisResult> => {
 		let piAiImage: PiAiImage;
@@ -562,9 +597,9 @@ async function analyzeImages(
 		const hash = hashImageData(piAiImage.data);
 
 		// Store image metadata on first encounter
-		storeImageMeta(hash, piAiImage.data);
+		storeImageMeta(imageMeta, hash, piAiImage.data);
 		// Retain bytes for later session recall via analyze_image
-		storeImageData(hash, piAiImage.data, piAiImage.mimeType);
+		storeImageData(imageData, hash, piAiImage.data, piAiImage.mimeType);
 
 		try {
 			const response = await complete(
@@ -1043,18 +1078,19 @@ async function handleAnalyzeImage(
 	// Resolve image references to PiAiImage objects.
 	// A reference is either a session-recall handle (the `image="..."` id from a
 	// prior <vision_proxy_description>/<vision_proxy_analysis> block) or a file path.
+	const { imageMeta, imageData } = getSessionState(ctx);
 	const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 	for (const ref of imageRefs) {
 		const recallHash = parseRecallRef(ref);
 		if (recallHash) {
-			const stored = getImageData(recallHash);
+			const stored = getImageData(imageData, recallHash);
 			if (!stored) {
 				return `Error: image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed. Ask the user to re-attach it, or pass a file path.`;
 			}
 			const image: PiAiImage = { type: "image", data: stored.data, mimeType: stored.mimeType };
 			// Backfill dimensions if metadata was evicted, so crops still work on recall.
-			storeImageMeta(recallHash, stored.data);
-			resolvedImages.push({ image, hash: recallHash, meta: _imageMeta.get(recallHash) });
+			storeImageMeta(imageMeta, recallHash, stored.data);
+			resolvedImages.push({ image, hash: recallHash, meta: imageMeta.get(recallHash) });
 			continue;
 		}
 
@@ -1067,9 +1103,9 @@ async function handleAnalyzeImage(
 			return `Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`;
 		}
 		const hash = hashImageData(r.image.data);
-		storeImageMeta(hash, r.image.data, r.filename);
-		storeImageData(hash, r.image.data, r.image.mimeType);
-		resolvedImages.push({ image: r.image, hash, meta: _imageMeta.get(hash) });
+		storeImageMeta(imageMeta, hash, r.image.data, r.filename);
+		storeImageData(imageData, hash, r.image.data, r.image.mimeType);
+		resolvedImages.push({ image: r.image, hash, meta: imageMeta.get(hash) });
 	}
 
 	// Build grounding instruction (needed for cache hit telemetry too)
@@ -1127,6 +1163,7 @@ async function handleAnalyzeImage(
 	const cacheKey = buildToolCacheKey(orderedHashes, cropSig, questionHash, `${visionProvider}/${visionModelId}`);
 
 	// Check cache
+	const _toolCache = getSessionState(ctx).toolCache;
 	const cached = _toolCache.get(cacheKey);
 	if (cached) {
 		// Log telemetry for cache hit
@@ -1288,14 +1325,15 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					// Rate limit per turn
-					_toolCallCount++;
-					if (_toolCallCount > MAX_TOOL_CALLS_PER_TURN) {
+					const state = getSessionState(extCtx);
+					state.toolCallCount++;
+					if (state.toolCallCount > MAX_TOOL_CALLS_PER_TURN) {
 						return { content: [{ type: "text" as const, text: `Error: analyze_image call limit reached (${MAX_TOOL_CALLS_PER_TURN} per turn). Rephrase your question or try in the next turn.` }] };
 					}
 
 					// Sync cache size with current config
-					if (_toolCache.maxSize !== config.cacheSize) {
-						_toolCache.resize(config.cacheSize);
+					if (state.toolCache.maxSize !== config.cacheSize) {
+						state.toolCache.resize(config.cacheSize);
 					}
 
 					const result = await handleAnalyzeImage(params, extCtx, pi, config);
@@ -1310,10 +1348,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-		// Clear per-session state from previous sessions
-		_imageMeta.clear();
-		_toolCache.clear();
-		clearImageData();
+		// Clear per-session state (defensive — a fresh session already gets a
+		// fresh state object keyed off its SessionManager).
+		const state = getSessionState(ctx);
+		state.toolCache.clear();
+		state.toolCallCount = 0;
+		state.imageMeta.clear();
+		clearImageData(state.imageData);
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
@@ -1330,7 +1371,10 @@ export default function (pi: ExtensionAPI) {
 			ctx: ExtensionContext,
 		): Promise<BeforeAgentStartEventResult | void> => {
 			// Reset per-turn tool call counter
-			_toolCallCount = 0;
+			const sessionState = getSessionState(ctx);
+			sessionState.toolCallCount = 0;
+			const imageMeta = sessionState.imageMeta;
+			const imageData = sessionState.imageData;
 
 			// Collect images: structured attachments + file paths detected in prompt text
 			const images: (PiAiImage | LegacyImage)[] = [...(event.images ?? [])];
@@ -1344,8 +1388,8 @@ export default function (pi: ExtensionAPI) {
 					acceptedPaths.push(fp);
 					// Store metadata
 					const hash = hashImageData(r.image.data);
-					storeImageMeta(hash, r.image.data, r.filename);
-					storeImageData(hash, r.image.data, r.image.mimeType);
+					storeImageMeta(imageMeta, hash, r.image.data, r.filename);
+					storeImageData(imageData, hash, r.image.data, r.image.mimeType);
 				} else if (r.reason && r.reason !== "not-an-image") {
 					ctx.ui.notify(
 						`[multimodal-proxy] Skipped ${fp}: ${describeReadReason(r.reason, r.bytes)}`,
@@ -1550,7 +1594,7 @@ export default function (pi: ExtensionAPI) {
 						: null;
 
 					if (jointVisionModel && jointAuth?.ok && jointAuth.apiKey) {
-						const jointMetas = successful.map((r) => ({ hash: r.hash, meta: _imageMeta.get(r.hash) }));
+						const jointMetas = successful.map((r) => ({ hash: r.hash, meta: imageMeta.get(r.hash) }));
 
 						// Build hints (FR-2.5.1, FR-2.5.2)
 						const hints: string[] = [];
@@ -1618,7 +1662,7 @@ export default function (pi: ExtensionAPI) {
 			// Build fenced descriptions with image metadata
 			const visionText = successful
 				.map((r, i) => {
-					const meta = _imageMeta.get(r.hash);
+					const meta = imageMeta.get(r.hash);
 					return buildDescriptionFence(r.hash, r.description, meta);
 				})
 				.join("\n\n");
@@ -1659,6 +1703,7 @@ export default function (pi: ExtensionAPI) {
 		if (!shouldStripImages(config, ctx.model)) return;
 
 		const descriptions = findDescriptions(entries);
+		const imageMeta = getSessionState(ctx).imageMeta;
 
 		// Restate the recall affordance once per context build (not per image),
 		// so the agent is reminded it can re-query earlier images even on turns
@@ -1681,7 +1726,7 @@ export default function (pi: ExtensionAPI) {
 				if (c.type === "image") {
 					const hash = hashImageData(c.data);
 					const desc = descriptions.get(hash);
-					const meta = _imageMeta.get(hash);
+					const meta = imageMeta.get(hash);
 					const blocks: { type: "text"; text: string }[] = [
 						{
 							type: "text" as const,
@@ -2095,18 +2140,19 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Resolve image references to PiAiImage (recall handle or file path)
+				const { imageMeta, imageData } = getSessionState(ctx);
 				const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 				for (const ref of parsed.images) {
 					const recallHash = parseRecallRef(ref);
 					if (recallHash) {
-						const stored = getImageData(recallHash);
+						const stored = getImageData(imageData, recallHash);
 						if (!stored) {
 							ctx.ui.notify(`[multimodal-proxy] Image "${recallHash}" is not available for recall — it may have expired from the session cache or was never analyzed.`, "error");
 							return;
 						}
 						const image: PiAiImage = { type: "image", data: stored.data, mimeType: stored.mimeType };
-						storeImageMeta(recallHash, stored.data);
-						resolvedImages.push({ image, hash: recallHash, meta: _imageMeta.get(recallHash) });
+						storeImageMeta(imageMeta, recallHash, stored.data);
+						resolvedImages.push({ image, hash: recallHash, meta: imageMeta.get(recallHash) });
 						continue;
 					}
 
@@ -2120,9 +2166,9 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const hash = hashImageData(r.image.data);
-					storeImageMeta(hash, r.image.data, r.filename);
-					storeImageData(hash, r.image.data, r.image.mimeType);
-					resolvedImages.push({ image: r.image, hash, meta: _imageMeta.get(hash) });
+					storeImageMeta(imageMeta, hash, r.image.data, r.filename);
+					storeImageData(imageData, hash, r.image.data, r.image.mimeType);
+					resolvedImages.push({ image: r.image, hash, meta: imageMeta.get(hash) });
 				}
 
 				if (resolvedImages.length === 0) {

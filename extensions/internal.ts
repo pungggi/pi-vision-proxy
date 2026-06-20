@@ -55,19 +55,28 @@ export interface ImageMeta {
 	filename?: string; // basename only
 }
 
-/** In-memory map: image hash → dimensions + filename. Populated on first ingestion. */
-export const _imageMeta = new Map<string, ImageMeta>();
+/**
+ * In-memory map: image hash → dimensions + filename, populated on first
+ * ingestion. Held per session (see SessionState in vision-proxy) rather than as
+ * a process-global, so forked/resumed sessions never inherit stale metadata.
+ */
+export type ImageMetaStore = Map<string, ImageMeta>;
+
+/** Create an empty per-session image-metadata store. */
+export function createImageMetaStore(): ImageMetaStore {
+	return new Map<string, ImageMeta>();
+}
 
 /** Maximum pixel dimension for decoded images. Prevents decode bombs (e.g., 10 MB PNG → 500 MB bitmap). */
 const MAX_IMAGE_DIMENSION = 16384; // 16K × 16K ≈ 1 billion pixels max
 
-/** Maximum entries in _imageMeta to prevent unbounded memory growth. */
+/** Maximum entries per image-metadata store to prevent unbounded memory growth. */
 const IMAGE_META_MAX = 500;
 
-function evictImageMeta(): void {
-	while (_imageMeta.size > IMAGE_META_MAX) {
-		const first = _imageMeta.keys().next().value;
-		if (first !== undefined) _imageMeta.delete(first);
+function evictImageMeta(meta: ImageMetaStore): void {
+	while (meta.size > IMAGE_META_MAX) {
+		const first = meta.keys().next().value;
+		if (first !== undefined) meta.delete(first);
 	}
 }
 
@@ -81,11 +90,21 @@ function evictImageMeta(): void {
 // posture intact. Insertion order is used for LRU eviction once the byte budget
 // is exceeded.
 
-/** In-memory map: image hash → retained base64 bytes + mime type, for recall. */
-export const _imageData = new Map<string, { data: string; mimeType: string }>();
+/**
+ * Per-session retained-bytes store for image recall: hash → base64 bytes + mime
+ * type, plus a running total of decoded bytes for budget enforcement. Held per
+ * session (see SessionState in vision-proxy) so retained image bytes never leak
+ * across sessions, mirroring the per-session image-metadata store.
+ */
+export interface ImageDataStore {
+	map: Map<string, { data: string; mimeType: string }>;
+	totalBytes: number;
+}
 
-/** Running total of retained decoded image bytes across _imageData. */
-let _imageDataBytes = 0;
+/** Create an empty per-session image-recall byte store. */
+export function createImageDataStore(): ImageDataStore {
+	return { map: new Map(), totalBytes: 0 };
+}
 
 /** Default byte budget for retained image data (decoded bytes, ≈64 MB). */
 const IMAGE_DATA_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
@@ -100,49 +119,49 @@ function imageDataMaxBytes(): number {
 	return IMAGE_DATA_MAX_BYTES_DEFAULT;
 }
 
-function evictImageData(): void {
+function evictImageData(store: ImageDataStore): void {
 	const budget = imageDataMaxBytes();
 	// When budget is 0, allow full eviction (recall disabled).
 	// Otherwise keep at least one entry so an oversized image is still recallable.
 	const minRetained = budget === 0 ? 0 : 1;
-	while (_imageDataBytes > budget && _imageData.size > minRetained) {
-		const first = _imageData.keys().next().value;
+	while (store.totalBytes > budget && store.map.size > minRetained) {
+		const first = store.map.keys().next().value;
 		if (first === undefined) break;
-		const v = _imageData.get(first);
-		_imageData.delete(first);
-		if (v) _imageDataBytes -= Buffer.byteLength(v.data, "base64");
+		const v = store.map.get(first);
+		store.map.delete(first);
+		if (v) store.totalBytes -= Buffer.byteLength(v.data, "base64");
 	}
 }
 
 /** Retain an image's bytes for later recall. No-op if already retained (LRU bumped). */
-export function storeImageData(hash: string, data: string, mimeType: string): void {
+export function storeImageData(store: ImageDataStore, hash: string, data: string, mimeType: string): void {
 	if (!hash || !data) return;
-	const existing = _imageData.get(hash);
+	const existing = store.map.get(hash);
 	if (existing) {
 		// Bump recency: re-insert at the end of the iteration order.
-		_imageData.delete(hash);
-		_imageData.set(hash, existing);
+		store.map.delete(hash);
+		store.map.set(hash, existing);
 		return;
 	}
-	_imageData.set(hash, { data, mimeType });
-	_imageDataBytes += Buffer.byteLength(data, "base64");
-	evictImageData();
+	store.map.set(hash, { data, mimeType });
+	store.totalBytes += Buffer.byteLength(data, "base64");
+	evictImageData(store);
 }
 
 /** Fetch retained image bytes by hash, bumping recency. Undefined if not retained. */
-export function getImageData(hash: string): { data: string; mimeType: string } | undefined {
-	const v = _imageData.get(hash);
+export function getImageData(store: ImageDataStore, hash: string): { data: string; mimeType: string } | undefined {
+	const v = store.map.get(hash);
 	if (v) {
-		_imageData.delete(hash);
-		_imageData.set(hash, v);
+		store.map.delete(hash);
+		store.map.set(hash, v);
 	}
 	return v;
 }
 
 /** Test/maintenance helper: drop all retained image bytes. */
-export function clearImageData(): void {
-	_imageData.clear();
-	_imageDataBytes = 0;
+export function clearImageData(store: ImageDataStore): void {
+	store.map.clear();
+	store.totalBytes = 0;
 }
 
 /**
@@ -1315,8 +1334,8 @@ function safeDimensions(data: Buffer): { width: number; height: number } | undef
 	return dims;
 }
 
-export function storeImageMeta(hash: string, imageBufferOrData: Buffer | string, filename?: string): void {
-	const existing = _imageMeta.get(hash);
+export function storeImageMeta(meta: ImageMetaStore, hash: string, imageBufferOrData: Buffer | string, filename?: string): void {
+	const existing = meta.get(hash);
 	if (existing) {
 		// Backfill filename if previously stored without one
 		if (filename && !existing.filename) {
@@ -1338,8 +1357,8 @@ export function storeImageMeta(hash: string, imageBufferOrData: Buffer | string,
 	}
 	const dims = safeDimensions(buf);
 	if (dims) {
-		_imageMeta.set(hash, { width: dims.width, height: dims.height, filename });
-		evictImageMeta();
+		meta.set(hash, { width: dims.width, height: dims.height, filename });
+		evictImageMeta(meta);
 	}
 }
 
@@ -1464,9 +1483,284 @@ export function cropSignature(crop: ResolvedCrop): string {
 export const hasCropper = true;
 
 /**
+ * Wall-clock limit for a single image decode, in milliseconds. Override via env
+ * for slow hosts or very large legitimate images.
+ */
+function decodeTimeoutMs(): number {
+	const raw = process.env.PI_VISION_PROXY_DECODE_TIMEOUT_MS;
+	if (raw) {
+		const n = Number.parseInt(raw, 10);
+		if (Number.isFinite(n) && n > 0) return n;
+	}
+	return 5000;
+}
+
+/**
+ * Decode image bytes, rejecting if the decoder does not settle within the
+ * timeout.
+ *
+ * SCOPE / LIMITATION: ImageScript's codecs are synchronous WASM. Once the WASM
+ * `decode()` call starts it blocks the single Node thread until it returns, so
+ * this timer cannot pre-empt a decode that is genuinely spinning on a crafted
+ * body — the timeout callback can't run while the event loop is blocked. What
+ * this wrapper *does* bound is the portions that yield (first-call WASM
+ * instantiation and any async codec paths) and it stops a late-resolving decode
+ * from leaving the caller hanging forever. The primary defence against
+ * pathological inputs remains the dimension pre-check in cropImage(); full CPU
+ * isolation would require running the decode in a terminable worker thread.
+ */
+async function decodeWithTimeout(imageBytes: Buffer): Promise<Image> {
+	const timeoutMs = decodeTimeoutMs();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => reject(new Error(`Image.decode exceeded ${timeoutMs}ms timeout`)), timeoutMs);
+	});
+	try {
+		return await Promise.race([Image.decode(new Uint8Array(imageBytes)), timeout]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+/**
+ * In-thread decode → crop → encode. Bounded only by decodeWithTimeout, which
+ * cannot pre-empt a synchronous WASM hang (see its doc). Used as a fallback when
+ * the worker path is unavailable or disabled.
+ */
+async function cropInThread(
+	imageBytes: Buffer,
+	crop: ResolvedCrop,
+	mimeType?: string,
+): Promise<Buffer | null> {
+	const img = await decodeWithTimeout(imageBytes);
+	// Double-check decoded dimensions (image-size is header-only, actual may differ)
+	if (img.width > MAX_IMAGE_DIMENSION || img.height > MAX_IMAGE_DIMENSION) {
+		return null;
+	}
+	const cropped = img.crop(crop.x, crop.y, crop.width, crop.height);
+	let encoded: Uint8Array;
+	if (mimeType === "image/png") {
+		encoded = await cropped.encode(1); // PNG with compression level 1 (fast)
+	} else {
+		encoded = await cropped.encodeJPEG(90); // JPEG quality 90
+	}
+	return Buffer.from(encoded);
+}
+
+/** Sentinel: the worker path could not run (worker_threads unavailable / disabled). */
+const WORKER_UNAVAILABLE = Symbol("worker-unavailable");
+
+/** Whether to offload decode/crop/encode to a terminable worker thread. Default on. */
+function decodeWorkerEnabled(): boolean {
+	const raw = process.env.PI_VISION_PROXY_DECODE_WORKER?.toLowerCase();
+	return raw !== "0" && raw !== "false" && raw !== "no" && raw !== "off";
+}
+
+// Persistent CommonJS worker body (run via `{ eval: true }`). ImageScript is
+// loaded once from the path supplied in workerData, then the worker serves crop
+// tasks in a message loop so a pooled worker can be reused across calls without
+// paying decode-library init each time. Running in a worker is what makes the
+// timeout a *hard* limit: the main thread stays responsive and can terminate()
+// this thread mid-decode, which a same-thread Promise.race cannot do against
+// synchronous WASM.
+const CROP_WORKER_SRC = `
+const { parentPort, workerData } = require("worker_threads");
+const { Image } = require(workerData.imagescriptPath);
+parentPort.on("message", async (task) => {
+	const { bytes, crop, mimeType, maxDim } = task;
+	try {
+		const img = await Image.decode(new Uint8Array(bytes));
+		if (img.width > maxDim || img.height > maxDim) { parentPort.postMessage({ ok: false }); return; }
+		const cropped = img.crop(crop.x, crop.y, crop.width, crop.height);
+		const encoded = mimeType === "image/png" ? await cropped.encode(1) : await cropped.encodeJPEG(90);
+		const u8 = encoded instanceof Uint8Array ? encoded : new Uint8Array(encoded);
+		const out = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+		parentPort.postMessage({ ok: true, data: out }, [out]);
+	} catch (e) {
+		parentPort.postMessage({ ok: false, error: String((e && e.message) || e) });
+	}
+});
+`;
+
+type NodeWorker = import("node:worker_threads").Worker;
+
+/** An idle pooled worker plus the cleanup that detaches its idle-health listeners. */
+interface PooledWorker {
+	worker: NodeWorker;
+	detach: () => void;
+}
+
+/** Idle, reusable workers. Bounded by maxIdleWorkers(); unref'd so they never block process exit. */
+const _idleWorkers: PooledWorker[] = [];
+
+/** Maximum idle workers retained between calls. 0 disables pooling (spawn-per-call). */
+function maxIdleWorkers(): number {
+	const raw = process.env.PI_VISION_PROXY_DECODE_WORKER_POOL;
+	if (raw) {
+		const n = Number.parseInt(raw, 10);
+		if (Number.isFinite(n) && n >= 0) return n;
+	}
+	return 2;
+}
+
+let _workerCtor: typeof import("node:worker_threads").Worker | null = null;
+let _imagescriptPath: string | null = null;
+let _workerInfraResolved = false;
+
+/** Resolve the Worker constructor and ImageScript path once. Returns false if unavailable. */
+async function ensureWorkerInfra(): Promise<boolean> {
+	if (_workerInfraResolved) return _workerCtor !== null && _imagescriptPath !== null;
+	_workerInfraResolved = true;
+	try {
+		_workerCtor = (await import("node:worker_threads")).Worker;
+		const { createRequire } = await import("node:module");
+		_imagescriptPath = createRequire(import.meta.url).resolve("imagescript");
+		return true;
+	} catch {
+		_workerCtor = null;
+		_imagescriptPath = null;
+		return false;
+	}
+}
+
+/** Take an idle worker (detaching its health listeners) or spawn a fresh one. */
+function acquireWorker(): NodeWorker {
+	const budget = maxIdleWorkers();
+	// Honor the *current* budget before reusing anything: terminate idle workers
+	// beyond it so a lowered PI_VISION_PROXY_DECODE_WORKER_POOL takes effect
+	// immediately rather than waiting for the pool to drain naturally. With
+	// budget 0 this empties the pool, making spawn-per-call truly spawn-per-call.
+	while (_idleWorkers.length > budget) {
+		const extra = _idleWorkers.pop()!;
+		extra.detach();
+		void extra.worker.terminate();
+	}
+	// Only reuse a pooled worker when pooling is enabled.
+	if (budget > 0) {
+		const pooled = _idleWorkers.pop();
+		if (pooled) {
+			pooled.detach();
+			pooled.worker.ref();
+			return pooled.worker;
+		}
+	}
+	// _workerCtor / _imagescriptPath are non-null here (ensureWorkerInfra succeeded).
+	return new _workerCtor!(CROP_WORKER_SRC, {
+		eval: true,
+		workerData: { imagescriptPath: _imagescriptPath },
+	});
+}
+
+/** Return a healthy worker to the idle pool (unref'd), or terminate it if the pool is full. */
+function releaseWorker(worker: NodeWorker): void {
+	if (_idleWorkers.length >= maxIdleWorkers()) {
+		void worker.terminate();
+		return;
+	}
+	// If the worker dies while idle, drop it from the pool so it is never reused.
+	const onDeath = () => {
+		const i = _idleWorkers.findIndex((p) => p.worker === worker);
+		if (i >= 0) _idleWorkers.splice(i, 1);
+	};
+	worker.once("exit", onDeath);
+	worker.once("error", onDeath);
+	worker.unref();
+	_idleWorkers.push({
+		worker,
+		detach: () => {
+			worker.off("exit", onDeath);
+			worker.off("error", onDeath);
+		},
+	});
+}
+
+/** Run one crop task on a worker with a hard timeout. `reusable` is false on timeout/error. */
+function runCropTask(
+	worker: NodeWorker,
+	task: { bytes: ArrayBuffer; crop: ResolvedCrop; mimeType?: string; maxDim: number },
+	timeoutMs: number,
+): Promise<{ result: Buffer | null; reusable: boolean }> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const settle = (result: Buffer | null, reusable: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			worker.off("message", onMessage);
+			worker.off("error", onError);
+			worker.off("exit", onExit);
+			resolve({ result, reusable });
+		};
+		const onMessage = (msg: { ok?: boolean; data?: ArrayBuffer }) =>
+			settle(msg && msg.ok && msg.data ? Buffer.from(msg.data) : null, true);
+		const onError = () => settle(null, false);
+		const onExit = () => settle(null, false);
+		// Timeout → not reusable: the worker may be wedged in a synchronous decode.
+		const timer = setTimeout(() => settle(null, false), timeoutMs);
+		worker.on("message", onMessage);
+		worker.on("error", onError);
+		worker.on("exit", onExit);
+		worker.postMessage(task, [task.bytes]);
+	});
+}
+
+/**
+ * Decode → crop → encode on a pooled, terminable worker thread with a hard
+ * timeout. Returns the cropped bytes, null on decode/crop failure (including a
+ * terminated timeout), or WORKER_UNAVAILABLE if worker infra is unavailable
+ * (caller should fall back to the in-thread path).
+ */
+async function cropInWorker(
+	imageBytes: Buffer,
+	crop: ResolvedCrop,
+	mimeType: string | undefined,
+	timeoutMs: number,
+): Promise<Buffer | null | typeof WORKER_UNAVAILABLE> {
+	if (!(await ensureWorkerInfra())) return WORKER_UNAVAILABLE;
+
+	let worker: NodeWorker;
+	try {
+		worker = acquireWorker();
+	} catch {
+		return WORKER_UNAVAILABLE;
+	}
+
+	// Detach a standalone, transferable copy of the bytes (Buffer pooling means
+	// imageBytes.buffer may be shared and unsafe to transfer directly).
+	const ab = imageBytes.buffer.slice(imageBytes.byteOffset, imageBytes.byteOffset + imageBytes.byteLength);
+
+	const { result, reusable } = await runCropTask(
+		worker,
+		{ bytes: ab, crop, mimeType, maxDim: MAX_IMAGE_DIMENSION },
+		timeoutMs,
+	);
+	if (reusable) releaseWorker(worker);
+	else void worker.terminate();
+	return result;
+}
+
+/**
+ * Terminate all idle pooled workers. Exposed for test teardown; safe to call
+ * anytime (a fresh worker is spawned on the next crop).
+ */
+export async function shutdownCropWorkers(): Promise<void> {
+	const pending = _idleWorkers.splice(0, _idleWorkers.length);
+	await Promise.all(pending.map((p) => {
+		p.detach();
+		return p.worker.terminate();
+	}));
+}
+
+/**
  * Crop an image buffer to the given pixel rectangle using ImageScript.
  * Accepts raw image bytes (JPEG/PNG) and returns cropped bytes in the same format.
  * Returns null if cropping fails.
+ *
+ * The decode/crop/encode runs in a terminable worker thread so a maliciously
+ * crafted image that makes the synchronous WASM decoder spin can be killed at the
+ * timeout instead of freezing the session. If worker_threads is unavailable (or
+ * disabled via PI_VISION_PROXY_DECODE_WORKER=0) it falls back to the in-thread
+ * path, which is still guarded by the dimension pre-check and decode timeout.
  */
 export async function cropImage(
 	imageBytes: Buffer,
@@ -1479,20 +1773,12 @@ export async function cropImage(
 		if (dims && (dims.width > MAX_IMAGE_DIMENSION || dims.height > MAX_IMAGE_DIMENSION)) {
 			return null;
 		}
-		const img = await Image.decode(new Uint8Array(imageBytes));
-		// Double-check decoded dimensions (image-size is header-only, actual may differ)
-		if (img.width > MAX_IMAGE_DIMENSION || img.height > MAX_IMAGE_DIMENSION) {
-			return null;
+		if (decodeWorkerEnabled()) {
+			const viaWorker = await cropInWorker(imageBytes, crop, mimeType, decodeTimeoutMs());
+			if (viaWorker !== WORKER_UNAVAILABLE) return viaWorker;
+			// else: worker infra unavailable — fall through to in-thread crop
 		}
-		const cropped = img.crop(crop.x, crop.y, crop.width, crop.height);
-		// Encode back to the same format
-		let encoded: Uint8Array;
-		if (mimeType === "image/png") {
-			encoded = await cropped.encode(1); // PNG with compression level 1 (fast)
-		} else {
-			encoded = await cropped.encodeJPEG(90); // JPEG quality 90
-		}
-		return Buffer.from(encoded);
+		return await cropInThread(imageBytes, crop, mimeType);
 	} catch {
 		return null;
 	}
