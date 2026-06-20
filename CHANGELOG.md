@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] - 2026-06-20
+
+### Added
+
+- **Session image recall** — the agent can now re-query an image it saw earlier in the session without a re-attachment or file path. Every `<vision_proxy_description>`, `<vision_proxy_analysis>`, and `<vision_proxy_joint_description>` block already carries an `image="..."` id; passing that id back to `analyze_image` (or `/multimodal-proxy describe`) recalls the original image bytes and re-runs the targeted question or crop against it (e.g. *"zoom into that screenshot from before"*).
+- Image bytes are retained **in process memory only** — never written to the session log or disk — in a byte-bounded LRU store (`PI_VISION_PROXY_IMAGE_RECALL_BYTES`, default 64 MB, oldest-first eviction).
+- **New env var**: `PI_VISION_PROXY_IMAGE_RECALL_BYTES`.
+- **Persistent recall reminder** — when the proxy rewrites earlier images into descriptions, it now restates once per turn (as trusted text, outside the untrusted fence) that those images can be re-queried by id, so the affordance is visible even on turns where no new image was attached.
+- **Live progress indicator** — slow image and video/audio analysis now animate a spinner with elapsed seconds on the status line (`multimodal-proxy ⠙ Analyzing image 2/4… (3s)`), restoring the steady-state status when the call completes. No-ops without a UI.
+- Unit tests for `parseRecallRef` (bare hash, `sha256:` prefix, `#crop` suffix, case normalization, path rejection), the recall store (round-trip, dedup, byte-budget eviction, oversized-single-image retention, recency bumping), `spinnerFrame`, `formatProgressStatus`, and `RECALL_HINT`.
+
+### Changed
+
+- `analyze_image` now accepts a recall handle (the fence `image="..."` id) as an image reference in addition to a file path; the previous hard rejection of `sha256:` references is removed. The tool schema, tool description, and the injected Vision Proxy system-prompt section document the recall handle.
+
 ## [1.4.0-beta.1] - 2026-05-03
 
 ### Added

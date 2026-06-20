@@ -71,6 +71,127 @@ function evictImageMeta(): void {
 	}
 }
 
+// ── Session image recall ────────────────────────────────────────────────────
+//
+// Retains the actual image bytes (base64) of images seen this session, keyed by
+// hash, so the agent can re-query a previously-seen image with analyze_image
+// even when it is no longer attached to the current turn (e.g. a screenshot the
+// user pasted several turns ago). Storage is in-memory only — image bytes are
+// never written to the session log or disk, keeping the existing data-egress
+// posture intact. Insertion order is used for LRU eviction once the byte budget
+// is exceeded.
+
+/** In-memory map: image hash → retained base64 bytes + mime type, for recall. */
+export const _imageData = new Map<string, { data: string; mimeType: string }>();
+
+/** Running total of retained decoded image bytes across _imageData. */
+let _imageDataBytes = 0;
+
+/** Default byte budget for retained image data (decoded bytes, ≈64 MB). */
+const IMAGE_DATA_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
+
+/** Resolve the recall byte budget, allowing an env override. */
+function imageDataMaxBytes(): number {
+	const raw = process.env.PI_VISION_PROXY_IMAGE_RECALL_BYTES;
+	if (raw) {
+		const n = Number.parseInt(raw, 10);
+		if (Number.isFinite(n) && n >= 0) return n;
+	}
+	return IMAGE_DATA_MAX_BYTES_DEFAULT;
+}
+
+function evictImageData(): void {
+	const budget = imageDataMaxBytes();
+	// When budget is 0, allow full eviction (recall disabled).
+	// Otherwise keep at least one entry so an oversized image is still recallable.
+	const minRetained = budget === 0 ? 0 : 1;
+	while (_imageDataBytes > budget && _imageData.size > minRetained) {
+		const first = _imageData.keys().next().value;
+		if (first === undefined) break;
+		const v = _imageData.get(first);
+		_imageData.delete(first);
+		if (v) _imageDataBytes -= Buffer.byteLength(v.data, "base64");
+	}
+}
+
+/** Retain an image's bytes for later recall. No-op if already retained (LRU bumped). */
+export function storeImageData(hash: string, data: string, mimeType: string): void {
+	if (!hash || !data) return;
+	const existing = _imageData.get(hash);
+	if (existing) {
+		// Bump recency: re-insert at the end of the iteration order.
+		_imageData.delete(hash);
+		_imageData.set(hash, existing);
+		return;
+	}
+	_imageData.set(hash, { data, mimeType });
+	_imageDataBytes += Buffer.byteLength(data, "base64");
+	evictImageData();
+}
+
+/** Fetch retained image bytes by hash, bumping recency. Undefined if not retained. */
+export function getImageData(hash: string): { data: string; mimeType: string } | undefined {
+	const v = _imageData.get(hash);
+	if (v) {
+		_imageData.delete(hash);
+		_imageData.set(hash, v);
+	}
+	return v;
+}
+
+/** Test/maintenance helper: drop all retained image bytes. */
+export function clearImageData(): void {
+	_imageData.clear();
+	_imageDataBytes = 0;
+}
+
+/**
+ * Parse an analyze_image reference as a session-recall handle.
+ *
+ * Accepts the `image="..."` value carried by <vision_proxy_description> and
+ * related fences — either a bare hash, a `sha256:`-prefixed hash, or a hash with
+ * a `#crop:...` suffix (the crop suffix is ignored; recall returns the full
+ * image and any crop is re-applied via the tool's crop argument). Returns the
+ * normalized lowercase hash, or null if the reference is not a recall handle
+ * (in which case it should be treated as a file path).
+ */
+export function parseRecallRef(ref: string): string | null {
+	let s = ref.trim();
+	if (s.startsWith("sha256:")) s = s.slice("sha256:".length);
+	const hashPart = s.split("#")[0];
+	const re = new RegExp(`^[a-f0-9]{${HASH_HEX_LEN}}$`, "i");
+	return re.test(hashPart) ? hashPart.toLowerCase() : null;
+}
+
+// ── Live progress indicator ─────────────────────────────────────────────────
+
+/** Braille spinner frames used by the live status indicator during slow calls. */
+export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Pick a spinner frame for a given tick (wraps around). */
+export function spinnerFrame(tick: number): string {
+	const n = SPINNER_FRAMES.length;
+	const i = ((Math.trunc(tick) % n) + n) % n;
+	return SPINNER_FRAMES[i];
+}
+
+/** Format the status-line text shown while a vision/video call is in flight. */
+export function formatProgressStatus(label: string, frame: string, elapsedSec: number): string {
+	const secs = Math.max(0, Math.trunc(elapsedSec));
+	return `multimodal-proxy ${frame} ${label} (${secs}s)`;
+}
+
+// ── Recall affordance ───────────────────────────────────────────────────────
+
+/**
+ * Persistent reminder injected once per turn alongside recalled image
+ * descriptions, restating that earlier images can be re-queried by id. This is
+ * trusted extension text (not image-derived), so it is placed outside the
+ * untrusted description fence.
+ */
+export const RECALL_HINT =
+	'You can re-examine or crop this or any earlier image at any time by calling analyze_image with its image id (the image="…" value above) — no re-attachment or file path needed.';
+
 // ── Crop types ────────────────────────────────────────────────────────────
 
 export type NamedRegion =
