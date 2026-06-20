@@ -71,7 +71,7 @@ import {
 	writePersistentFile,
 	sanitizeForLog,
 	storeImageMeta,
-	_imageMeta,
+	createImageMetaStore,
 } from "../internal.ts";
 
 // SessionEntry minimal shape — typed loose because peer dep types are not loaded in test
@@ -2043,8 +2043,9 @@ describe("Security: image decode bomb protection", () => {
 		const img = new Image(100, 100);
 		const encoded = Buffer.from(await img.encode(1));
 		const hash = "test-decode-bomb-normal";
-		storeImageMeta(hash, encoded);
-		const meta = _imageMeta.get(hash);
+		const store = createImageMetaStore();
+		storeImageMeta(store, hash, encoded);
+		const meta = store.get(hash);
 		// Normal image should be accepted
 		assert.ok(meta, "normal image should be stored");
 	});
@@ -2135,10 +2136,21 @@ describe("Review fixes: storeImageMeta filename backfill", () => {
 		const img = new Image(50, 60);
 		const encoded = Buffer.from(await img.encode(1));
 		const hash = "test-backfill-filename";
-		storeImageMeta(hash, encoded); // first call, no filename
-		storeImageMeta(hash, encoded, "photo.png"); // second call, with filename
-		const meta = _imageMeta.get(hash);
+		const store = createImageMetaStore();
+		storeImageMeta(store, hash, encoded); // first call, no filename
+		storeImageMeta(store, hash, encoded, "photo.png"); // second call, with filename
+		const meta = store.get(hash);
 		assert.ok(meta, "meta should exist");
 		assert.equal(meta!.filename, "photo.png", "filename should be backfilled");
+	});
+
+	it("keeps stores isolated — one session's metadata does not leak into another (issue #12)", async () => {
+		const { Image } = await import("imagescript");
+		const encoded = Buffer.from(await new Image(40, 30).encode(1));
+		const sessionA = createImageMetaStore();
+		const sessionB = createImageMetaStore();
+		storeImageMeta(sessionA, "shared-hash", encoded, "a.png");
+		assert.ok(sessionA.get("shared-hash"), "session A should have the metadata");
+		assert.equal(sessionB.get("shared-hash"), undefined, "session B must not inherit it");
 	});
 });

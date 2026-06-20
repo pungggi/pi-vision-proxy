@@ -22,8 +22,6 @@ import {
 	bufferToPiAiImage,
 	resolveCropEntry,
 	hashImageData,
-	_imageMeta,
-	storeImageMeta,
 	extractDimensions,
 	computePHash,
 	hammingDistance,

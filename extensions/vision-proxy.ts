@@ -97,6 +97,8 @@ import {
 	hashImageData,
 	hammingDistance,
 	type ImageMeta,
+	type ImageMetaStore,
+	createImageMetaStore,
 	type LegacyImage,
 	parseDescribeArgs,
 	parseGroundingFormat,
@@ -126,7 +128,6 @@ import {
 	type VideoDescriptionEntry,
 	VALID_GROUNDING_FORMATS,
 	writePersistentFile,
-	_imageMeta,
 	storeImageMeta,
 	DEFAULT_VIDEO_SYSTEM_PROMPT,
 } from "./internal.js";
@@ -212,6 +213,8 @@ interface SessionState {
 	toolCache: LRUCache<string, string>;
 	/** Current turn's tool call count (reset on each before_agent_start). */
 	toolCallCount: number;
+	/** Image hash → dimensions/filename, populated on first ingestion this session. */
+	imageMeta: ImageMetaStore;
 }
 
 const _sessionState = new WeakMap<object, SessionState>();
@@ -220,7 +223,11 @@ function getSessionState(ctx: ExtensionContext): SessionState {
 	const key = ctx.sessionManager as unknown as object;
 	let state = _sessionState.get(key);
 	if (!state) {
-		state = { toolCache: new LRUCache<string, string>(DEFAULT_TOOL_CACHE_SIZE), toolCallCount: 0 };
+		state = {
+			toolCache: new LRUCache<string, string>(DEFAULT_TOOL_CACHE_SIZE),
+			toolCallCount: 0,
+			imageMeta: createImageMetaStore(),
+		};
 		_sessionState.set(key, state);
 	}
 	return state;
@@ -516,6 +523,7 @@ async function analyzeImages(
 		? `\n\n## Recent conversation (untrusted user dialogue, for grounding only)\n<conversation>\n${conversationContext}\n</conversation>`
 		: "";
 
+	const imageMeta = getSessionState(ctx).imageMeta;
 	const tasks = images.map(async (raw, i): Promise<AnalysisResult> => {
 		let piAiImage: PiAiImage;
 		try {
@@ -526,7 +534,7 @@ async function analyzeImages(
 		const hash = hashImageData(piAiImage.data);
 
 		// Store image metadata on first encounter
-		storeImageMeta(hash, piAiImage.data);
+		storeImageMeta(imageMeta, hash, piAiImage.data);
 
 		try {
 			const response = await complete(
@@ -992,6 +1000,7 @@ async function handleAnalyzeImage(
 	}
 
 	// Resolve image references to PiAiImage objects
+	const imageMeta = getSessionState(ctx).imageMeta;
 	const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 	for (const ref of imageRefs) {
 		if (ref.startsWith("sha256:")) {
@@ -1007,8 +1016,8 @@ async function handleAnalyzeImage(
 			return `Error: could not read image: ${describeReadReason(r.reason ?? "not-an-image", r.bytes)}`;
 		}
 		const hash = hashImageData(r.image.data);
-		storeImageMeta(hash, r.image.data, r.filename);
-		resolvedImages.push({ image: r.image, hash, meta: _imageMeta.get(hash) });
+		storeImageMeta(imageMeta, hash, r.image.data, r.filename);
+		resolvedImages.push({ image: r.image, hash, meta: imageMeta.get(hash) });
 	}
 
 	// Build grounding instruction (needed for cache hit telemetry too)
@@ -1251,11 +1260,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-		// Clear per-session state from previous sessions
-		_imageMeta.clear();
+		// Clear per-session state (defensive — a fresh session already gets a
+		// fresh state object keyed off its SessionManager).
 		const state = getSessionState(ctx);
 		state.toolCache.clear();
 		state.toolCallCount = 0;
+		state.imageMeta.clear();
 
 		_fileConfig = await readPersistentFile();
 		const config = resolveConfig(ctx.sessionManager.getEntries(), process.env, _fileConfig);
@@ -1275,7 +1285,9 @@ export default function (pi: ExtensionAPI) {
 			ctx: ExtensionContext,
 		): Promise<BeforeAgentStartEventResult | void> => {
 			// Reset per-turn tool call counter
-			getSessionState(ctx).toolCallCount = 0;
+			const sessionState = getSessionState(ctx);
+			sessionState.toolCallCount = 0;
+			const imageMeta = sessionState.imageMeta;
 
 			// Collect images: structured attachments + file paths detected in prompt text
 			const images: (PiAiImage | LegacyImage)[] = [...(event.images ?? [])];
@@ -1289,7 +1301,7 @@ export default function (pi: ExtensionAPI) {
 					acceptedPaths.push(fp);
 					// Store metadata
 					const hash = hashImageData(r.image.data);
-					storeImageMeta(hash, r.image.data, r.filename);
+					storeImageMeta(imageMeta, hash, r.image.data, r.filename);
 				} else if (r.reason && r.reason !== "not-an-image") {
 					ctx.ui.notify(
 						`[multimodal-proxy] Skipped ${fp}: ${describeReadReason(r.reason, r.bytes)}`,
@@ -1485,7 +1497,7 @@ export default function (pi: ExtensionAPI) {
 						: null;
 
 					if (jointVisionModel && jointAuth?.ok && jointAuth.apiKey) {
-						const jointMetas = successful.map((r) => ({ hash: r.hash, meta: _imageMeta.get(r.hash) }));
+						const jointMetas = successful.map((r) => ({ hash: r.hash, meta: imageMeta.get(r.hash) }));
 
 						// Build hints (FR-2.5.1, FR-2.5.2)
 						const hints: string[] = [];
@@ -1553,7 +1565,7 @@ export default function (pi: ExtensionAPI) {
 			// Build fenced descriptions with image metadata
 			const visionText = successful
 				.map((r, i) => {
-					const meta = _imageMeta.get(r.hash);
+					const meta = imageMeta.get(r.hash);
 					return buildDescriptionFence(r.hash, r.description, meta);
 				})
 				.join("\n\n");
@@ -1590,6 +1602,7 @@ export default function (pi: ExtensionAPI) {
 		if (!shouldStripImages(config, ctx.model)) return;
 
 		const descriptions = findDescriptions(entries);
+		const imageMeta = getSessionState(ctx).imageMeta;
 
 		let modified = false;
 		const messages = event.messages.map((msg) => {
@@ -1606,7 +1619,7 @@ export default function (pi: ExtensionAPI) {
 				if (c.type === "image") {
 					const hash = hashImageData(c.data);
 					const desc = descriptions.get(hash);
-					const meta = _imageMeta.get(hash);
+					const meta = imageMeta.get(hash);
 					return [
 						{
 							type: "text" as const,
@@ -2015,6 +2028,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Resolve image references to PiAiImage
+				const imageMeta = getSessionState(ctx).imageMeta;
 				const resolvedImages: { image: PiAiImage; hash: string; meta?: ImageMeta }[] = [];
 				for (const ref of parsed.images) {
 					if (ref.includes("..")) {
@@ -2027,8 +2041,8 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const hash = hashImageData(r.image.data);
-					storeImageMeta(hash, r.image.data, r.filename);
-					resolvedImages.push({ image: r.image, hash, meta: _imageMeta.get(hash) });
+					storeImageMeta(imageMeta, hash, r.image.data, r.filename);
+					resolvedImages.push({ image: r.image, hash, meta: imageMeta.get(hash) });
 				}
 
 				if (resolvedImages.length === 0) {

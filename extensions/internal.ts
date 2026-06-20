@@ -55,19 +55,28 @@ export interface ImageMeta {
 	filename?: string; // basename only
 }
 
-/** In-memory map: image hash → dimensions + filename. Populated on first ingestion. */
-export const _imageMeta = new Map<string, ImageMeta>();
+/**
+ * In-memory map: image hash → dimensions + filename, populated on first
+ * ingestion. Held per session (see SessionState in vision-proxy) rather than as
+ * a process-global, so forked/resumed sessions never inherit stale metadata.
+ */
+export type ImageMetaStore = Map<string, ImageMeta>;
+
+/** Create an empty per-session image-metadata store. */
+export function createImageMetaStore(): ImageMetaStore {
+	return new Map<string, ImageMeta>();
+}
 
 /** Maximum pixel dimension for decoded images. Prevents decode bombs (e.g., 10 MB PNG → 500 MB bitmap). */
 const MAX_IMAGE_DIMENSION = 16384; // 16K × 16K ≈ 1 billion pixels max
 
-/** Maximum entries in _imageMeta to prevent unbounded memory growth. */
+/** Maximum entries per image-metadata store to prevent unbounded memory growth. */
 const IMAGE_META_MAX = 500;
 
-function evictImageMeta(): void {
-	while (_imageMeta.size > IMAGE_META_MAX) {
-		const first = _imageMeta.keys().next().value;
-		if (first !== undefined) _imageMeta.delete(first);
+function evictImageMeta(meta: ImageMetaStore): void {
+	while (meta.size > IMAGE_META_MAX) {
+		const first = meta.keys().next().value;
+		if (first !== undefined) meta.delete(first);
 	}
 }
 
@@ -1194,8 +1203,8 @@ function safeDimensions(data: Buffer): { width: number; height: number } | undef
 	return dims;
 }
 
-export function storeImageMeta(hash: string, imageBufferOrData: Buffer | string, filename?: string): void {
-	const existing = _imageMeta.get(hash);
+export function storeImageMeta(meta: ImageMetaStore, hash: string, imageBufferOrData: Buffer | string, filename?: string): void {
+	const existing = meta.get(hash);
 	if (existing) {
 		// Backfill filename if previously stored without one
 		if (filename && !existing.filename) {
@@ -1217,8 +1226,8 @@ export function storeImageMeta(hash: string, imageBufferOrData: Buffer | string,
 	}
 	const dims = safeDimensions(buf);
 	if (dims) {
-		_imageMeta.set(hash, { width: dims.width, height: dims.height, filename });
-		evictImageMeta();
+		meta.set(hash, { width: dims.width, height: dims.height, filename });
+		evictImageMeta(meta);
 	}
 }
 
