@@ -4,7 +4,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { basename, dirname, extname, join, parse, relative } from "node:path";
 import type { ImageContent as PiAiImage } from "@earendil-works/pi-ai";
@@ -1059,16 +1059,33 @@ function driveAccessDisabled(): boolean {
 
 /**
  * Check that a resolved file path is within a safe directory.
- * By default allows tmpdir, cwd, and local Windows drive paths; opt into homedir
- * on non-drive platforms via PI_VISION_PROXY_ALLOW_HOME=1.
+ * By default allows tmpdir, /tmp (system-wide Unix temp), cwd, and local Windows drive paths;
+ * opt into homedir on non-drive platforms via PI_VISION_PROXY_ALLOW_HOME=1.
  * Both sides are canonicalized via realpath to handle symlinks and Windows 8.3 short names.
+ * If the target file does not exist, the parent directory is resolved so callers can
+ * distinguish "allowed dir but missing file" (→ "unreadable") from a genuinely denied path.
  */
 export async function isPathAllowed(filePath: string): Promise<boolean> {
 	let resolved: string;
 	try {
 		resolved = (await realpath(filePath)).toLowerCase();
 	} catch {
-		return false;
+		// realpath failed. Determine whether the path itself exists (e.g. broken symlink)
+		// or is simply absent. For broken symlinks the target is outside our control, so
+		// deny. For absent paths, fall back to the parent directory so that
+		// readImageFileWithReason can return "unreadable" rather than the misleading "denied".
+		try {
+			await lstat(filePath); // succeeds for broken symlinks; throws for absent paths
+			return false; // path exists (broken symlink or inaccessible) — deny
+		} catch {
+			// Path is absent — resolve via parent to check if it would be in an allowed dir.
+		}
+		const parent = dirname(filePath);
+		try {
+			resolved = join((await realpath(parent)).toLowerCase(), basename(filePath).toLowerCase());
+		} catch {
+			return false;
+		}
 	}
 
 	const tmp = await canonical(os.tmpdir?.() ?? "/tmp");
@@ -1076,6 +1093,14 @@ export async function isPathAllowed(filePath: string): Promise<boolean> {
 
 	if (tmp && isInsideOrSame(resolved, tmp)) return true;
 	if (cwd && isInsideOrSame(resolved, cwd)) return true;
+
+	// On Unix, /tmp (the POSIX system-wide temp dir) may differ from os.tmpdir()
+	// (e.g. on macOS where os.tmpdir() returns a per-user dir like /var/folders/…/T).
+	// Allow it explicitly so files written to /tmp are always accessible.
+	if (os.platform() !== "win32") {
+		const unixTmp = await canonical("/tmp");
+		if (unixTmp && unixTmp !== tmp && isInsideOrSame(resolved, unixTmp)) return true;
+	}
 
 	if (process.env.PI_VISION_PROXY_ALLOW_HOME === "1") {
 		const home = await canonical(os.homedir?.());
@@ -1100,6 +1125,11 @@ export async function readImageFileWithReason(filePath: string): Promise<ReadIma
 	} catch {
 		return { image: null, reason: "unreadable" };
 	}
+	// Post-read re-verification: the initial isPathAllowed() may have passed via the
+	// parent-dir fallback when the file did not yet exist. A symlink could have been
+	// swapped in during that window. Now that the file exists, realpath() resolves it
+	// fully — catching any symlink pointing outside the allow-list (TOCTOU mitigation).
+	if (!(await isPathAllowed(filePath))) return { image: null, reason: "denied" };
 	if (content.length === 0) return { image: null, reason: "empty", bytes: 0 };
 	const limit = maxImageFileBytes();
 	if (content.length > limit) return { image: null, reason: "too-large", bytes: content.length };
