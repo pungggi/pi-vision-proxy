@@ -506,7 +506,7 @@ function describeReadMediaReason(reason: ReadMediaReason, bytes?: number): strin
 		case "too-large":
 			return `${bytes ?? "?"} bytes exceeds limit (override with PI_VISION_PROXY_MAX_VIDEO_BYTES)`;
 		case "not-a-media":
-			return "unsupported video/audio extension";
+			return "unsupported video/audio extension, or a source-code file with an overloaded extension (e.g. a TypeScript `.ts` file) whose contents did not match the expected media signature";
 		default:
 			return reason;
 	}

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.2] - 2026-06-26
+
+### Fixed
+
+- **Source-code files with overloaded media extensions are no longer sent to video models.** The `.ts` extension is mapped to both TypeScript (source code) and MPEG-TS (`video/mp2t`) video. Previously, a file like `store.ts` mentioned in a prompt was matched by the video-path extractor, read as a 200 MB media file, and shipped to the configured video provider (e.g. "Analyzing store.ts via Grok 4.3…"). `readMediaFileWithReason` now sniffs the file contents for extensions whose primary meaning is source code (`.ts`, `.mts`, `.m2ts`): it validates the MPEG-TS sync byte (`0x47`) at the start of the first few 188-byte packets and rejects the file as `not-a-media` when the signature is absent. Genuine MPEG-TS streams continue to work; TypeScript files no longer leak source code to a video model. The `not-a-media` skip message in `vision-proxy.ts` was updated to describe the new content-sniffing behavior.
+
 ## [1.7.0] - 2026-06-20
 
 ### Added

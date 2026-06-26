@@ -1166,9 +1166,48 @@ function maxVideoFileBytes(): number {
 }
 
 /**
+ * MPEG Transport Stream packet size (bytes). Real .ts/.mts/.m2ts video streams
+ * carry a 0x47 sync byte at the start of every 188-byte packet.
+ */
+const MPEG_TS_PACKET_SIZE = 188;
+const MPEG_TS_SYNC_BYTE = 0x47;
+
+/**
+ * Validate that a buffer plausibly contains an MPEG-TS video stream by checking
+ * that the 0x47 sync byte appears at the start of the first few 188-byte
+ * packets. This distinguishes genuine TS video from source-code files (e.g.
+ * TypeScript `.ts`) that merely share the extension.
+ *
+ * Returns true for a valid (or too-short-to-check) stream, false when the sync
+ * byte is missing — i.e. the file is almost certainly not MPEG-TS video.
+ */
+function looksLikeMpegTs(content: Buffer): boolean {
+	// Need at least one full packet to verify the pattern reliably.
+	if (content.length < MPEG_TS_PACKET_SIZE) return true; // ambiguous — don't reject
+	const packetsToCheck = Math.min(4, Math.floor(content.length / MPEG_TS_PACKET_SIZE));
+	for (let i = 0; i < packetsToCheck; i++) {
+		if (content[i * MPEG_TS_PACKET_SIZE] !== MPEG_TS_SYNC_BYTE) return false;
+	}
+	return true;
+}
+
+/**
+ * Extensions whose primary real-world meaning is *source code* rather than the
+ * video container they happen to map to in the MIME registry. These require
+ * content sniffing before being accepted as media.
+ */
+const SOURCE_CODE_VIDEO_EXTS = new Set([".ts", ".mts", ".m2ts"]);
+
+/**
  * Read a video or audio file and return as base64 with structured reason on failure.
  * Uses the PiAiImage shape ({ type: "image", data, mimeType }) as a carrier —
  * the onPayload hook rewrites the wire format to the correct video_url / audio type.
+ *
+ * For extensions that are overloaded with a source-code meaning (notably `.ts`,
+ * which is both TypeScript and MPEG-TS video), the file contents are sniffed
+ * against the expected media signature before being accepted. This prevents a
+ * TypeScript file such as `store.ts` from being shipped to a video model just
+ * because its extension matches the MPEG-TS MIME mapping.
  */
 export async function readMediaFileWithReason(filePath: string): Promise<ReadMediaResult> {
 	const ext = extname(filePath).toLowerCase();
@@ -1186,6 +1225,12 @@ export async function readMediaFileWithReason(filePath: string): Promise<ReadMed
 	if (content.length === 0) return { media: null, reason: "empty", bytes: 0 };
 	const limit = maxVideoFileBytes();
 	if (content.length > limit) return { media: null, reason: "too-large", bytes: content.length };
+
+	// Sniff content for extensions overloaded with a source-code meaning.
+	if (SOURCE_CODE_VIDEO_EXTS.has(ext) && !looksLikeMpegTs(content)) {
+		return { media: null, reason: "not-a-media" };
+	}
+
 	return {
 		media: { type: "image", data: content.toString("base64"), mimeType },
 		bytes: content.length,

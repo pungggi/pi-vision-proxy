@@ -51,6 +51,7 @@ import {
 	pluralImages,
 	readEnvOverrides,
 	readImageFileWithReason,
+	readMediaFileWithReason,
 	readPersistentFile,
 	resolveConfig,
 	resolveCropEntry,
@@ -932,6 +933,59 @@ describe("readImageFileWithReason", () => {
 			const r = await readImageFileWithReason(link);
 			assert.equal(r.image, null);
 			assert.equal(r.reason, "denied");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("readMediaFileWithReason", () => {
+	it("returns reason=not-a-media for unsupported extension", async () => {
+		const r = await readMediaFileWithReason("/tmp/foo.xyzunknown");
+		assert.equal(r.media, null);
+		assert.equal(r.reason, "not-a-media");
+	});
+
+	it("rejects a TypeScript .ts file as not-a-media (extension collision with MPEG-TS)", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "store.ts");
+		// Larger than one MPEG-TS packet (188 bytes) so the sniff check runs.
+		await writeFile(file, "// TypeScript source file, not video\n".repeat(20));
+		try {
+			const r = await readMediaFileWithReason(file);
+			assert.equal(r.media, null);
+			assert.equal(r.reason, "not-a-media");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts a real MPEG-TS .ts file with valid sync bytes", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "clip.ts");
+		// Build a buffer of 8 packets, each starting with the 0x47 sync byte.
+		const packet = Buffer.alloc(188);
+		packet[0] = 0x47;
+		const content = Buffer.concat(Array.from({ length: 8 }, () => packet));
+		await writeFile(file, content);
+		try {
+			const r = await readMediaFileWithReason(file);
+			assert.ok(r.media, "media should be returned for valid MPEG-TS");
+			assert.equal(r.media?.mimeType, "video/mp2t");
+			assert.equal(r.media?.type, "image");
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns reason=empty for zero-byte .ts file", async () => {
+		const dir = await mkdtemp(join(os.tmpdir(), "vp-test-"));
+		const file = join(dir, "empty.ts");
+		await writeFile(file, "");
+		try {
+			const r = await readMediaFileWithReason(file);
+			assert.equal(r.media, null);
+			assert.equal(r.reason, "empty");
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
